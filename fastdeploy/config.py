@@ -322,12 +322,15 @@ class SpeculativeConfig:
         self.method: Optional[str] = None
         # the max length of speculative tokens
         self.num_speculative_tokens: int = 1
+        # the model runner step of draft model/mtp...
+        self.num_model_steps: int = 1
         # the max length of candidate tokens for speculative method
         self.max_candidate_len: int = 5
         # the max length of verify window for speculative method
         self.verify_window: int = 2
         # ngram match
         self.max_ngram_size: int = 5
+        self.min_ngram_size: int = 2
         # model for mtp/eagle/draft_model
         self.model: Optional[str] = None
         # quantization of model

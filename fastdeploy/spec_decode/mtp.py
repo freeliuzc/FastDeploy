@@ -317,7 +317,7 @@ class MTPProposer(Proposer):
         self.model_inputs["max_len_tensor_cpu"] = None  # CPU
 
         # Input tokens
-        self.model_inputs["draft_tokens"] = paddle.full(shape=[self.max_num_seqs, 2], fill_value=-1, dtype="int64")
+        self.model_inputs["draft_tokens"] = paddle.full(shape=[self.max_num_seqs, self.max_draft_token_num + 1], fill_value=-1, dtype="int64")
 
         self.model_inputs["encoder_block_lens"] = paddle.clone(self.main_model_inputs["encoder_block_lens"])
 
@@ -335,10 +335,14 @@ class MTPProposer(Proposer):
 
         self.model_inputs["batch_drop"] = paddle.full(shape=[self.max_num_seqs, 1], fill_value=False, dtype="bool")
         self.model_inputs["used_list_len"] = paddle.full(shape=[self.max_num_seqs], fill_value=0, dtype="int32")
-        if self.max_draft_token_num > 1:
+        if self.num_model_steps > 1:
             self.last_seq_lens_this_time = paddle.full_like(
                 self.main_model_inputs["seq_lens_this_time"], fill_value=-1, dtype="int32"
             )
+
+        # For mixed mtp-ngram method
+        self.input_ids_len = paddle.zeros(shape=[self.max_num_seqs, 1], dtype="int64").cpu()
+
 
     def insert_prefill_inputs(self, req_dicts: List[Request], num_running_requests: int):
         """
@@ -363,6 +367,7 @@ class MTPProposer(Proposer):
             request = req_dicts[i]
             idx = request.idx
             length = len(request.prompt_token_ids)
+            self.input_ids_len[idx] = length
 
             if req_dicts[i].disaggregate_info is not None and req_dicts[i].disaggregate_info["role"] == "decode":
                 length = len(request.prompt_token_ids)
@@ -459,6 +464,7 @@ class MTPProposer(Proposer):
             self.model_inputs["step_idx"],
             self.model_inputs["not_need_stop"],
             self.model_inputs["batch_drop"],
+            self.model_inputs["pre_ids"],
             self.main_model_inputs["accept_tokens"],
             self.main_model_inputs["accept_num"],
             self.main_model_inputs["seq_lens_encoder"],
@@ -467,11 +473,15 @@ class MTPProposer(Proposer):
             self.main_model_inputs["stop_flags"],
             self.main_model_inputs["is_block_step"],
             self.main_model_inputs["draft_tokens"],
-            self.max_draft_token_num,
+            self.num_model_steps,
             self.speculative_method in ["eagle", "mtp"],
             self.role == "prefill",
         )
-
+        # print("D MTP input ==========")
+        # print("D draft_tokens", self.model_inputs["draft_tokens"])
+        # print("D seq_lens_decoder", self.model_inputs["seq_lens_decoder"])
+        # print("D seq_lens_this_time", self.model_inputs["seq_lens_this_time"])
+        # print("End D==========")
         target_hidden_states = eagle_get_hidden_states(
             full_hidden_states,
             self.model_inputs["seq_lens_this_time"],
@@ -481,7 +491,7 @@ class MTPProposer(Proposer):
             self.main_model_inputs["accept_num"],
             self.main_model_inputs["seq_lens_this_time"],
             self.main_model_inputs["seq_lens_encoder"],
-            self.max_draft_token_num,
+            self.num_model_steps,
         )
         if isinstance(target_hidden_states, list):
             target_hidden_states = target_hidden_states[0]
@@ -521,7 +531,7 @@ class MTPProposer(Proposer):
         """
         Main process for MTP inference
         """
-        for substep in range(self.max_draft_token_num):
+        for substep in range(self.num_model_steps):
             if self.model_inputs["not_need_stop"]:
                 self.model_inputs["substep"] = substep
                 # Remove padding
@@ -541,6 +551,7 @@ class MTPProposer(Proposer):
                     self.model_inputs["seq_lens_encoder"],
                     self.model_inputs["seq_lens_decoder"],
                 )
+
                 # Initialize forward meta data
                 self.model_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
                 self.model_inputs["cum_offsets"].copy_(cum_offsets, False)
@@ -551,6 +562,17 @@ class MTPProposer(Proposer):
                 self.model_inputs["output_cum_offsets"] = output_cum_offsets
                 self.model_inputs["output_padding_offset"] = output_padding_offset
                 self._initialize_forward_meta()
+                # print(f"================== {substep}==============/")
+                # print("ids_remove_padding", self.model_inputs["ids_remove_padding"])
+                # print("cum_offsets", self.model_inputs["cum_offsets"])
+                # print("batch_id_per_token", self.model_inputs["batch_id_per_token"])
+                # print("cu_seqlens_q", self.model_inputs["cu_seqlens_q"])
+                # print("cu_seqlens_k", self.model_inputs["cu_seqlens_k"])
+                # print("output_cum_offsets", self.model_inputs["output_cum_offsets"])
+                # print("output_padding_offset", self.model_inputs["output_padding_offset"])
+                # print("seq_lens_decoder", self.model_inputs["seq_lens_decoder"])
+                # print("seq_lens_this_time", self.model_inputs["seq_lens_this_time"])
+                # print("draft_tokens", self.model_inputs["draft_tokens"])
 
                 # Get sampling metadata
                 self.sampling_metadata = SamplingMetadata(
@@ -567,7 +589,7 @@ class MTPProposer(Proposer):
                     eos_token_ids=self.model_inputs["eos_token_id"],
                 )
 
-                if self.max_draft_token_num > 1:
+                if self.num_model_steps > 1:
                     self.last_seq_lens_this_time = paddle.clone(self.model_inputs["seq_lens_this_time"])
 
                 model_output = self.model(
@@ -601,8 +623,15 @@ class MTPProposer(Proposer):
 
                 self._post_process(sampled_token_ids)
 
-                if substep != self.max_draft_token_num - 1:
+                if substep != self.num_model_steps - 1:
                     target_hidden_states = self._get_self_hidden_states(hidden_states)
+
+                # print("D MTP Output ==========")
+                # print("D draft_tokens", self.model_inputs["draft_tokens"])
+                # print("D seq_lens_decoder", self.model_inputs["seq_lens_decoder"])
+                # print("D seq_lens_this_time", self.model_inputs["seq_lens_this_time"])
+                # print("End D==========")
+
 
     def _get_self_hidden_states(self, hidden_states):
         target_hidden_states = eagle_get_self_hidden_states(
@@ -656,6 +685,41 @@ class MTPProposer(Proposer):
             self.main_model_inputs["seq_lens_encoder"],
             self.main_model_inputs["stop_flags"],
         )
+
+        if (self.num_model_steps < self.max_draft_token_num):
+            from profile_ops import static_op_ngram_match_mixed
+
+            draft_tokens = self.main_model_inputs["draft_tokens"].cpu()
+            seq_lens_this_time = self.main_model_inputs["seq_lens_this_time"].cpu()
+            seq_lens_decoder = self.model_inputs["seq_lens_decoder"].cpu()
+            # print("**************\n     before mixed_ngram: ")
+            # print("     main draft_tokens", draft_tokens)
+            # print("     main seq_lens_this_time", seq_lens_this_time)
+            # print("self.max_draft_token_num", self.max_draft_token_num)
+            device = paddle.CUDAPinnedPlace()
+                # self.model_inputs["input_ids"]._copy_to(device, True),
+                # self.input_ids_len,
+                # self.model_inputs["pre_ids"]._copy_to(device, True),
+            static_op_ngram_match_mixed(
+                self.model_inputs["input_ids"]._copy_to(device, True),
+                self.input_ids_len,
+                self.model_inputs["pre_ids"]._copy_to(device, True),
+                self.model_inputs["step_idx"].cpu(),
+                self.main_model_inputs["actual_draft_token_num"].cpu(),
+                draft_tokens,
+                seq_lens_this_time,
+                seq_lens_decoder,
+                self.model_inputs["max_dec_len"].cpu(),
+                self.max_ngram_size,
+                self.min_ngram_size,
+                self.max_draft_token_num,
+            )
+            self.main_model_inputs["draft_tokens"][:] = draft_tokens.cuda()
+            self.main_model_inputs["seq_lens_this_time"][:] = seq_lens_this_time.cuda()
+            # print("     after mixed_ngram: ")
+            # print("     main draft_tokens", draft_tokens)
+            # print("     main seq_lens_this_time", seq_lens_this_time)
+            # print("***************")
 
         mtp_step_paddle(
             self.main_model_inputs["stop_flags"],

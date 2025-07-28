@@ -64,7 +64,7 @@ from fastdeploy.model_executor.models.ernie4_5_vl.modeling_resampler import Scat
 from fastdeploy.worker.model_runner_base import ModelRunnerBase
 from fastdeploy.worker.output import ModelOutputData, ModelRunnerOutput
 
-
+global_step = [0]
 class GPUModelRunner(ModelRunnerBase):
     def __init__(
         self,
@@ -790,6 +790,7 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["seq_lens_encoder"],
             self.share_inputs["seq_lens_decoder"],
         )
+        # print(f"ids_remove_padding.shape {ids_remove_padding.shape}: {ids_remove_padding.numpy().tolist()}", )
 
         self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
         self.share_inputs["cum_offsets"].copy_(cum_offsets, False)
@@ -1281,6 +1282,7 @@ class GPUModelRunner(ModelRunnerBase):
         skip_idx_list = self._get_skip_idx(model_forward_batch)
         self._prepare_inputs()
         self.sampler.pre_process(skip_idx_list)
+        print("starttttttttttttttttttt")
 
         # NOTE(wufeisheng): If `not_need_stop`` is False, it means the current worker is in an idle state.
         # This logic is not used in TP (Tensor Parallelism) mode. However, in EP (Expert Parallelism) mode,
@@ -1288,7 +1290,14 @@ class GPUModelRunner(ModelRunnerBase):
         if not self.not_need_stop():
             self._execute_empty_input()
             return None
+        print("+++++++++++++++++++++++++++++++++ \n Target model Run", global_step[0])
+        global_step[0] += 1
+        print("B draft_tokens, ", self.share_inputs["draft_tokens"])
+        print("B seq_lens_this_time, ", self.share_inputs["seq_lens_this_time"])
+        print("B seq_lens_decoder, ", self.share_inputs["seq_lens_decoder"])
 
+        # print("B seq_lens_decoder", self.share_inputs["seq_lens_decoder"])
+        # print("B step_idx",  self.share_inputs["step_idx"])
         # 2. Padding inputs for cuda graph
         self.padding_cudagraph_inputs()
 
@@ -1305,6 +1314,7 @@ class GPUModelRunner(ModelRunnerBase):
                 ids_remove_padding=self.share_inputs["ids_remove_padding"],
                 forward_meta=self.forward_meta,
             )
+            # print("model_output", model_output)
             hidden_states = rebuild_padding(
                 model_output,
                 self.share_inputs["cum_offsets"],
@@ -1396,13 +1406,21 @@ class GPUModelRunner(ModelRunnerBase):
             speculative_decoding=self.speculative_decoding,
             skip_save_output=skip_save_output,
         )
+        if self.proposer is not None:
+            print("----------------")
+            print("accept_tokens", self.share_inputs["accept_tokens"])
+            print("accept_num", self.share_inputs["accept_num"])
+            # # print("base pre_ids", self.share_inputs["pre_ids"].numpy().tolist())
+            # print("base step_idx", self.share_inputs["step_idx"])
 
+        print("MTP Run")
         # 6. Speculative decode
         if self.speculative_decoding:
             if self.speculative_method == "mtp":
                 self.proposer.run(full_hidden_states=model_output)
             else:
                 self.proposer.run(share_inputs=self.share_inputs)
+        print("MTP Finish")
 
         # 7. Updata 'infer_seed' and step_cuda()
         self.share_inputs["infer_seed"].add_(self.infer_seed_increment)
