@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 import paddle
 import paddle.nn.functional as F
 from paddle import nn
+from profile_ops import speculate_compute_accept_ratio
 
 from fastdeploy.config import FDConfig
 from fastdeploy.model_executor.guided_decoding.base_guided_decoding import (
@@ -403,6 +404,23 @@ class SpeculativeSampler(nn.Layer):
             True,  # enable_topp
             self.speculative_benchmark_mode,
         )
+
+        speculate_compute_accept_ratio(
+            share_inputs["stats_real_accept_ratio"],
+            share_inputs["stats_verify_accept_ratio"],
+            share_inputs["stats_num_draft_token"],
+            share_inputs["stats_num_verify_token"],
+            share_inputs["stats_num_accept_token"],
+            share_inputs["accept_num"],
+            share_inputs["seq_lens_this_time"],
+            share_inputs["seq_lens_encoder"],
+            share_inputs["seq_lens_decoder"],
+        )
+        # print("stats_real_accept_ratio", share_inputs["stats_real_accept_ratio"])
+        # print("stats_verify_accept_ratio", share_inputs["stats_verify_accept_ratio"])
+        # print("stats_num_draft_token", share_inputs["stats_num_draft_token"])
+        # print("stats_num_verify_token", share_inputs["stats_num_verify_token"])
+        # print("stats_num_accept_token", share_inputs["stats_num_accept_token"])
 
         return None
 

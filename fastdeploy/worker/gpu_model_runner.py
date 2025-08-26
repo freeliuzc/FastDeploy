@@ -65,12 +65,29 @@ from fastdeploy.model_executor.pre_and_post_process import (
 if not (current_platform.is_dcu() or current_platform.is_iluvatar()):
     from fastdeploy.spec_decode import MTPProposer, NgramProposer
 
+from paddle import profiler
+
 from fastdeploy import envs
 from fastdeploy.input.mm_processor import DataProcessor
 from fastdeploy.model_executor.forward_meta import ForwardMeta
 from fastdeploy.model_executor.models.ernie4_5_vl.modeling_resampler import ScatterOp
 from fastdeploy.worker.model_runner_base import ModelRunnerBase
 from fastdeploy.worker.output import ModelOutputData, ModelRunnerOutput
+
+
+def my_on_trace_ready(prof):  # 定义回调函数，性能分析器结束采集数据时会被调用
+    callback = profiler.export_chrome_tracing("./profiler_demo")  # 创建导出性能数据到profiler_demo文件夹的回调函数
+    callback(prof)  # 执行该导出函数
+    prof.summary(sorted_by=profiler.SortedKeys.GPUTotal)  # 打印表单，按GPUTotal排序表单项
+
+
+profiler_mode = [False]
+if profiler_mode[0]:
+    p = profiler.Profiler(
+        scheduler=[1000, 1030], on_trace_ready=my_on_trace_ready, timer_only=False
+    )  # 初始化Profiler对象
+    p.start()
+global_step = [0]
 
 
 class GPUModelRunner(ModelRunnerBase):
@@ -764,6 +781,25 @@ class GPUModelRunner(ModelRunnerBase):
                 fill_value=0,
                 dtype="int32",
             )
+            # Dynamic adjusting num_speculative_token for each query
+            self.share_inputs["stats_real_accept_ratio"] = paddle.zeros(
+                shape=[max_draft_token_num, 1], dtype="float32"
+            )
+            self.share_inputs["stats_verify_accept_ratio"] = paddle.zeros(
+                shape=[max_draft_token_num, 1], dtype="float32"
+            )
+            # draft token in each pos:[0:max_draft_token_num]; accept_token in each pos:[max_draft_token_num:2*max_draft_token_num]
+            self.share_inputs["stats_num_draft_token"] = paddle.zeros(shape=[max_draft_token_num, 1], dtype="int64")
+            self.share_inputs["stats_num_accept_token"] = paddle.zeros(shape=[max_draft_token_num, 1], dtype="int64")
+            self.share_inputs["stats_num_verify_token"] = paddle.zeros(shape=[max_draft_token_num, 1], dtype="int64")
+
+            self.share_inputs["stas_accept_ratio_per_query"] = paddle.zeros(
+                shape=[max_num_seqs, max_draft_token_num], dtype="float32"
+            )
+            # [0:100] queue   100 head 101 tail
+            self.share_inputs["stas_step_lantency"] = paddle.zeros(shape=[102], dtype="float64").cpu()
+            self.share_inputs["stas_step_lantency"][100] = 0
+            self.share_inputs["stas_step_lantency"][101] = 1
 
         if self.enable_mm:
             head_dim = self.model_config.head_dim
@@ -814,6 +850,7 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["seq_lens_encoder"],
             self.share_inputs["seq_lens_decoder"],
         )
+        # print(f"ids_remove_padding.shape {ids_remove_padding.shape}: {ids_remove_padding.numpy().tolist()}", )
 
         self.share_inputs["ids_remove_padding"].copy_(ids_remove_padding, False)
         self.share_inputs["batch_id_per_token"].copy_(batch_id_per_token, False)
@@ -1302,6 +1339,7 @@ class GPUModelRunner(ModelRunnerBase):
             num_running_requests: batch_size
         """
         # 1. Prepare inputs of model and sampler.
+        t_start = time.time()
         skip_idx_list = self._get_skip_idx(model_forward_batch)
         self._prepare_inputs()
         self.sampler.pre_process(skip_idx_list)
@@ -1312,7 +1350,19 @@ class GPUModelRunner(ModelRunnerBase):
         if not self.not_need_stop():
             self._execute_empty_input()
             return None
+        print("+++++++++++++++++++++++++++++++++ \n Target model Run", global_step[0])
+        global_step[0] += 1
 
+        if global_step[0] == 1040 and profiler_mode[0]:
+            p.stop()
+            exit(0)
+
+        # print("B draft_tokens, ", self.share_inputs["draft_tokens"])
+        # print("B seq_lens_this_time, ", self.share_inputs["seq_lens_this_time"])
+        # print("B seq_lens_decoder, ", self.share_inputs["seq_lens_decoder"])
+
+        # print("B seq_lens_decoder", self.share_inputs["seq_lens_decoder"])
+        # print("B step_idx",  self.share_inputs["step_idx"])
         # 2. Padding inputs for cuda graph
         self.padding_cudagraph_inputs()
 
@@ -1329,6 +1379,7 @@ class GPUModelRunner(ModelRunnerBase):
                 ids_remove_padding=self.share_inputs["ids_remove_padding"],
                 forward_meta=self.forward_meta,
             )
+            # print("model_output", model_output)
             hidden_states = rebuild_padding(
                 model_output,
                 self.share_inputs["cu_seqlens_q"],
@@ -1420,13 +1471,22 @@ class GPUModelRunner(ModelRunnerBase):
             speculative_decoding=self.speculative_decoding,
             skip_save_output=skip_save_output,
         )
+        if self.proposer is not None:
+            pass
+            # print("----------------")
+            # print("accept_tokens", self.share_inputs["accept_tokens"])
+            # print("accept_num", self.share_inputs["accept_num"])
+            # # print("base pre_ids", self.share_inputs["pre_ids"].numpy().tolist())
+            # print("base step_idx", self.share_inputs["step_idx"])
 
+        # print("MTP Run")
         # 6. Speculative decode
         if self.speculative_decoding:
             if self.speculative_method == "mtp":
                 self.proposer.run(full_hidden_states=model_output)
             else:
                 self.proposer.run(share_inputs=self.share_inputs)
+        # print("MTP Finish")
 
         # 7. Updata 'infer_seed' and step_cuda()
         self.share_inputs["infer_seed"].add_(self.infer_seed_increment)
@@ -1447,6 +1507,10 @@ class GPUModelRunner(ModelRunnerBase):
         self.seq_lens_this_time_buffer[:num_running_requests].copy_(
             self.share_inputs["seq_lens_this_time"][:num_running_requests], False
         )
+        t_end = time.time()
+        logger.info(f"step_time: {(t_end - t_start) * 1000:.2f}ms")
+        if profiler_mode[0]:
+            p.step()
         return None
 
     def _add_cache(self, model_forward_batch) -> None:
