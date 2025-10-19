@@ -424,6 +424,11 @@ class SpeculativeSampler(nn.Layer):
         )
 
         probs = F.softmax(logits)
+        print(f"+=============================")
+        top_p, top_k = padding_sampling_params()
+        _, sampled_token_ids = top_k_top_p_sampling(probs, sampling_metadata.top_p, sampling_metadata.top_k, seed=sampling_metadata.seed[0, 0])
+        print(f"probs: {probs}")
+        print(f"sampled_token_ids: {sampled_token_ids}")
 
         verify_scores, verify_tokens, actual_candidate_len = top_p_candidates(
             probs,
@@ -434,6 +439,7 @@ class SpeculativeSampler(nn.Layer):
         )
 
         speculate_verify(
+            sampled_token_ids,
             share_inputs["accept_tokens"],
             share_inputs["accept_num"],
             share_inputs["step_idx"],
@@ -459,6 +465,8 @@ class SpeculativeSampler(nn.Layer):
             self.speculative_benchmark_mode,
             accept_all_drafts,
         )
+        print(f' accept_tokens: {share_inputs["accept_tokens"]}')
+        print(f' accept_num: {share_inputs["accept_num"]}')
 
         if think_end_id > 0 and line_break_id > 0:
             speculate_limit_thinking_content_length_v2(
