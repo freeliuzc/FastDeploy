@@ -703,7 +703,7 @@ class SpeculativeConfig:
         self,
         args,
     ):
-        self.method_list = ["ngram_match", "mtp"]
+        self.method_list = ["ngram_match", "mtp", "suffix"]
         self.mtp_strategy_list = ["default", "with_ngram"]
 
         # speculative method, choose in [None, "ngram_match", "mtp", "hybrid_mtp_ngram"]
@@ -721,6 +721,11 @@ class SpeculativeConfig:
         # ngram match
         self.max_ngram_size: int = 5
         self.min_ngram_size: int = 2
+        # suffix decoding
+        self.suffix_decoding_max_tree_depth: int = 64
+        self.suffix_decoding_max_cached_requests: int = -1
+        self.suffix_decoding_max_spec_factor: float = 1.0
+        self.suffix_decoding_min_token_prob: float = 0.1
         # model for mtp/eagle/draft_model
         self.model: Optional[str] = None
         # quantization of model
