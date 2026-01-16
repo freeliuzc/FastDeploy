@@ -84,7 +84,7 @@ from fastdeploy.model_executor.pre_and_post_process import (
 )
 
 if not (current_platform.is_dcu() or current_platform.is_iluvatar()):
-    from fastdeploy.spec_decode import MTPProposer, NgramProposer
+    from fastdeploy.spec_decode import MTPProposer, NgramProposer, SuffixProposer
 
 import zmq
 
@@ -359,6 +359,8 @@ class GPUModelRunner(ModelRunnerBase):
                 self.device_id,
                 self.share_inputs,
             )
+        elif self.speculative_method == "suffix":
+            self.proposer = SuffixProposer(self.fd_config)
         else:
             self.proposer = None
 
@@ -726,6 +728,13 @@ class GPUModelRunner(ModelRunnerBase):
                 self.forward_batch_reqs_list[idx] = request
                 has_prefill_task = True
 
+                if self.speculative_decoding and self.speculative_method == "suffix" and self.proposer is not None:
+                    if isinstance(request.prompt_token_ids, np.ndarray):
+                        prompt_token_ids = request.prompt_token_ids.tolist()
+                    else:
+                        prompt_token_ids = request.prompt_token_ids
+                    self.proposer.start_request(idx, request.request_id, prompt_token_ids)
+
                 # Routing Replay
                 if self.fd_config.routing_replay_config.enable_routing_replay:
                     if prefill_start_index == 0:
@@ -973,6 +982,15 @@ class GPUModelRunner(ModelRunnerBase):
                     return res
                 else:
                     return default_value
+
+            # Start suffix decoding request if using suffix proposer
+            if self.speculative_decoding and self.speculative_method == "suffix" and self.proposer is not None:
+                if isinstance(request.prompt_token_ids, np.ndarray):
+                    prompt_token_ids = request.prompt_token_ids.tolist()
+                else:
+                    prompt_token_ids = request.prompt_token_ids
+                self.proposer.start_request(request.request_id, prompt_token_ids)
+                self.proposer.update_request_mapping(request.request_id, idx)
 
             assert len(request.eos_token_ids) == self.model_config.eos_tokens_lens
             self.share_inputs["eos_token_id"][:] = np.array(request.eos_token_ids, dtype="int64").reshape(-1, 1)
@@ -2330,7 +2348,18 @@ class GPUModelRunner(ModelRunnerBase):
 
         # 2. Padding inputs for cuda graph
         self.padding_cudagraph_inputs()
+        logger.info("===================Target Model Input ======================")
+        logger.info(f"T seq_lens_this_time: {self.forward_meta.seq_lens_this_time}")
+        logger.info(f'T seq_lens_encoder: {self.share_inputs["seq_lens_encoder"],}')
+        logger.info(f'T seq_lens_decoder: {self.share_inputs["seq_lens_decoder"],}')
+        logger.info(f'T stop_flags: {self.share_inputs["stop_flags"],}')
+        logger.info(f'T step_idx: {self.share_inputs["step_idx"],}')
+        # logger.info(f'T attn_mask_offsets: {self.forward_meta.attn_mask_offsets}')
 
+        if self.proposer is not None:
+            logger.info(f'T draft_tokens: {self.share_inputs["draft_tokens"],}')
+
+        logger.info("===================FIn Input ======================")
         # 3. Execute model
         if self.enable_mm:
             model_output = self.model(
@@ -2533,13 +2562,18 @@ class GPUModelRunner(ModelRunnerBase):
             )
             if self.guided_backend is not None and sampler_output is not None:
                 self.sampler.post_process(sampler_output.sampled_token_ids)
-
+            if self.proposer is not None:
+                logger.info(f'T accept_num: {self.share_inputs["accept_num"]}')
+                logger.info(f'T accept_tokens: {self.share_inputs["accept_tokens"]}')
             # 6. Speculative decode
             if self.speculative_decoding:
+                logger.info("proposer run")
                 if self.speculative_method == "mtp":
                     self.proposer.run(
                         full_hidden_states=model_output, step_use_cudagraph=self.forward_meta.step_use_cudagraph
                     )
+                elif self.speculative_method == "suffix":
+                    self.proposer.run(share_inputs=self.share_inputs)
                 else:
                     self.proposer.run(share_inputs=self.share_inputs)
 
