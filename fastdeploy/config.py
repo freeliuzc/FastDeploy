@@ -1660,7 +1660,7 @@ class FDConfig:
 
         # Initialize cuda graph capture list
         max_capture_shape = self.scheduler_config.max_num_seqs
-        if self.speculative_config is not None and self.speculative_config.method == "mtp":
+        if self.speculative_config is not None:
             max_capture_shape = self.scheduler_config.max_num_seqs * (
                 self.speculative_config.num_speculative_tokens + 1
             )

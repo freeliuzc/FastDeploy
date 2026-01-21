@@ -125,8 +125,9 @@ class SuffixProposer(Proposer):
         seq_lens_this_time = share_inputs["seq_lens_this_time"]
 
         stop_flags = share_inputs["stop_flags"].cpu().numpy().flatten()
-        accept_tokens = share_inputs["accept_tokens"].cpu()
-        accept_num = share_inputs["accept_num"].cpu()
+        is_block_step = share_inputs["is_block_step"].cpu().numpy().flatten()
+        accept_tokens = share_inputs["accept_tokens"].cpu().numpy().flatten()
+        accept_num = share_inputs["accept_num"].cpu().numpy().flatten()
         seq_lens_encoder = share_inputs["seq_lens_encoder"].cpu().numpy().flatten().astype(np.int32)
         seq_lens_decoder = share_inputs["seq_lens_decoder"].cpu().numpy().flatten().astype(np.int32)
 
@@ -136,57 +137,40 @@ class SuffixProposer(Proposer):
         draft_tokens_cpu = draft_tokens.cpu()
 
         for bid in range(batch_size):
+            req_id = self.idx_to_req_id.get(bid)
             # ---------- 1. stop 优先级最高 ----------
             if stop_flags[bid]:
-                req_id = self.idx_to_req_id.get(bid)
-                if req_id is not None and req_id in self.suffix_cache.active_requests:
-                    self.stop_request(req_id)
-
                 seq_lens_this_time[bid, 0] = 0
                 draft_tokens_cpu[bid, :] = -1
+                if not is_block_step[bid]:
+                    if req_id is not None and req_id in self.suffix_cache.active_requests:
+                        self.stop_request(req_id)
                 continue
-
-            # ---------- 2. 非 stop：兜底处理 ----------
-            req_id = self.idx_to_req_id.get(bid)
-            if req_id is None:
-                # 没有映射，但还在跑：不给 speculate，保证行为可预期
+            else:
                 seq_lens_this_time[bid, 0] = 1
                 draft_tokens_cpu[bid, 1:] = -1
-                continue
 
             # ---------- 3. accept ----------
             acc_n = int(accept_num[bid])
-            if acc_n > 0 and req_id in self.suffix_cache.active_requests:
+            if acc_n > 0 and req_id is not None and req_id in self.suffix_cache.active_requests:
                 token_ids = accept_tokens[bid, :acc_n]
                 ctx_start = seq_lens_decoder[bid] - acc_n
                 self.context_tokens[bid, ctx_start : ctx_start + acc_n] = token_ids
                 self.add_active_response(req_id, token_ids)
 
-            seq_lens_this_time[bid, 0] = 1
-
-            # ---------- 4. 非 active request ----------
-            if req_id not in self.suffix_cache.active_requests:
-                draft_tokens_cpu[bid, 1:] = -1
-                continue
-
             num_tokens = total_lens[bid]
-            if num_tokens >= self.max_model_len:
-                draft_tokens_cpu[bid, 1:] = -1
-                continue
-
             # ---------- 5. context ----------
             start = max(0, num_tokens - self.max_tree_depth)
             ctx = self.context_tokens[bid, start:num_tokens].numpy()
             ctx = ctx[ctx >= 0]
 
             if ctx.size == 0:
-                draft_tokens_cpu[bid, 1:] = -1
                 continue
 
-            # if not ctx.flags["CONTIGUOUS"]:
-            ctx = np.ascontiguousarray(ctx, dtype=np.int32)
-            # else:
-            #     ctx = ctx.astype(np.int32, copy=False)
+            if not ctx.flags["CONTIGUOUS"]:
+                ctx = np.ascontiguousarray(ctx, dtype=np.int32)
+            else:
+                ctx = ctx.astype(np.int32, copy=False)
 
             max_spec_tokens = min(
                 self.max_draft_token_num,
@@ -204,6 +188,7 @@ class SuffixProposer(Proposer):
                 max_spec_factor=self.max_spec_factor,
                 min_token_prob=self.min_token_prob,
             )
+            logger.info(f"req_id: {req_id}, ctx: {ctx}, draft_tokens: {draft}")
 
             token_ids = draft.token_ids
             n = min(len(token_ids), self.max_draft_token_num)
@@ -216,6 +201,7 @@ class SuffixProposer(Proposer):
                 draft_tokens_cpu[bid, 1:] = -1
 
         share_inputs["draft_tokens"][:] = draft_tokens_cpu.cuda()
+        share_inputs["seq_lens_this_time"][:] = seq_lens_this_time.cuda()
 
     def _update_request_mapping(self, idx: int, req_id: str):
         """

@@ -96,3 +96,27 @@ class Proposer(ABC):
             bool: True if chunk prefill is enabled; False otherwise.
         """
         return False
+
+    def prepare_dummy_speculative_drafts(
+        self,
+        share_inputs,
+        batch_size: int,
+    ) -> None:
+        """
+        为 CUDAGraph capture 场景构造一组 dummy draft tokens，
+        仅用于稳定 shape / 步数，不要求语义正确。
+
+        Args:
+            share_inputs: GPUModelRunner 维护的 share_inputs dict
+            batch_size:   当前 dummy_run 的 batch_size
+            expected_decode_len: 预期 decode 步数（和 _dummy_run 传入保持一致）
+        """
+
+        max_fake_drafts = self.max_draft_token_num
+
+        stop = share_inputs["stop_flags"][0].item()
+        if not stop:
+            share_inputs["draft_tokens"][:batch_size, :max_fake_drafts] = 5
+            share_inputs["seq_lens_this_time"][:batch_size] = max_fake_drafts + 1
+        else:
+            share_inputs["seq_lens_this_time"][:batch_size] = 0
