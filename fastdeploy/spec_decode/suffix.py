@@ -14,6 +14,8 @@
 # limitations under the License.
 """
 
+import time
+
 import numpy as np
 import paddle
 from paddleformers.utils.log import logger
@@ -61,6 +63,7 @@ class SuffixProposer(Proposer):
             fill_value=-1,
             dtype="int64",
         ).cpu()
+        self.ban_tokens = [101031, 101032, 101033]
 
     def start_request(self, idx: int, req_id: str, prompt_token_ids: list[int]):
         """
@@ -92,12 +95,15 @@ class SuffixProposer(Proposer):
         Args:
             req_id: Request identifier
         """
+        # logger.info(f"stop_request {req_id}")
         if req_id in self.suffix_cache.active_requests:
             self.suffix_cache.stop_request(req_id)
 
         # Clean up mappings
         if req_id in self.req_id_to_idx:
             idx = self.req_id_to_idx[req_id]
+            # logger.info(f"del {req_id}->idx {idx}")
+
             del self.req_id_to_idx[req_id]
             if idx in self.idx_to_req_id:
                 del self.idx_to_req_id[idx]
@@ -121,48 +127,69 @@ class SuffixProposer(Proposer):
         self.suffix_cache.add_active_response(req_id, token_array)
 
     def _run_impl(self, share_inputs):
-        draft_tokens = share_inputs["draft_tokens"]
-        seq_lens_this_time = share_inputs["seq_lens_this_time"]
 
-        stop_flags = share_inputs["stop_flags"].cpu().numpy().flatten()
-        is_block_step = share_inputs["is_block_step"].cpu().numpy().flatten()
-        accept_tokens = share_inputs["accept_tokens"].cpu().numpy().flatten()
-        accept_num = share_inputs["accept_num"].cpu().numpy().flatten()
+        stop_flags_cpu = share_inputs["stop_flags"].cpu().numpy().flatten()
+        is_block_step_cpu = share_inputs["is_block_step"].cpu().numpy().flatten()
+        accept_tokens_cpu = share_inputs["accept_tokens"].cpu()
+        accept_num_cpu = share_inputs["accept_num"].cpu().numpy().flatten()
         seq_lens_encoder = share_inputs["seq_lens_encoder"].cpu().numpy().flatten().astype(np.int32)
         seq_lens_decoder = share_inputs["seq_lens_decoder"].cpu().numpy().flatten().astype(np.int32)
 
-        total_lens = seq_lens_encoder + seq_lens_decoder
-        batch_size = seq_lens_this_time.shape[0]
+        draft_tokens_cpu = share_inputs["draft_tokens"].cpu()
+        seq_lens_this_time_cpu = share_inputs["seq_lens_this_time"].cpu()
 
-        draft_tokens_cpu = draft_tokens.cpu()
+        total_lens = seq_lens_encoder + seq_lens_decoder
+        batch_size = seq_lens_this_time_cpu.shape[0]
+
+        # logger.info(f"self.suffix_cache.active_requests: {self.suffix_cache.active_requests}")
+        # logger.info(f"stop_flags: {stop_flags_cpu}")
+        # logger.info(f"is_block_step_cpu: {is_block_step_cpu}")
 
         for bid in range(batch_size):
+
             req_id = self.idx_to_req_id.get(bid)
             # ---------- 1. stop 优先级最高 ----------
-            if stop_flags[bid]:
-                seq_lens_this_time[bid, 0] = 0
+            if stop_flags_cpu[bid]:
+                seq_lens_this_time_cpu[bid] = 0
                 draft_tokens_cpu[bid, :] = -1
-                if not is_block_step[bid]:
+                if not is_block_step_cpu[bid]:
                     if req_id is not None and req_id in self.suffix_cache.active_requests:
                         self.stop_request(req_id)
                 continue
             else:
-                seq_lens_this_time[bid, 0] = 1
+                seq_lens_this_time_cpu[bid] = 1
                 draft_tokens_cpu[bid, 1:] = -1
+            # ----------- skip some cases -----------
+            assert req_id in self.suffix_cache.active_requests, f"bid: {bid} req_id: {req_id} not in active_requests"
+            num_tokens = total_lens[bid]
+            max_spec_tokens = min(
+                self.max_draft_token_num,
+                self.max_model_len - num_tokens - 1,
+            )
+            if max_spec_tokens <= 1:
+                logger.info(f"bid: {bid} req_id: {req_id} skip from max_spec_tokens: {max_spec_tokens}")
+                continue
+            if req_id is None:
+                logger.info(f"bid: {bid} req_id: {req_id} skip from None req_id")
+                continue
 
             # ---------- 3. accept ----------
-            acc_n = int(accept_num[bid])
-            if acc_n > 0 and req_id is not None and req_id in self.suffix_cache.active_requests:
-                token_ids = accept_tokens[bid, :acc_n]
+            acc_n = int(accept_num_cpu[bid])
+
+            assert acc_n > 0, f"bid: {bid} req_id: {req_id} accept_num: {acc_n}"
+            if acc_n > 0:
+                token_ids = accept_tokens_cpu[bid, :acc_n]
                 ctx_start = seq_lens_decoder[bid] - acc_n
                 self.context_tokens[bid, ctx_start : ctx_start + acc_n] = token_ids
                 self.add_active_response(req_id, token_ids)
+                # logger.info(f"accept_tokens_cpu: {token_ids}. self.context_tokens: {self.context_tokens}")
 
-            num_tokens = total_lens[bid]
             # ---------- 5. context ----------
             start = max(0, num_tokens - self.max_tree_depth)
             ctx = self.context_tokens[bid, start:num_tokens].numpy()
+            # logger.info(f"{bid}: {req_id}, match from {start} to {num_tokens}: ctx:{ctx}")
             ctx = ctx[ctx >= 0]
+            # logger.info(f"masked ctx:{ctx}")
 
             if ctx.size == 0:
                 continue
@@ -172,14 +199,7 @@ class SuffixProposer(Proposer):
             else:
                 ctx = ctx.astype(np.int32, copy=False)
 
-            max_spec_tokens = min(
-                self.max_draft_token_num,
-                self.max_model_len - num_tokens - 1,
-            )
-            if max_spec_tokens <= 1:
-                draft_tokens_cpu[bid, 1:] = -1
-                continue
-
+            t1 = time.time()
             # ---------- 6. speculate ----------
             draft = self.suffix_cache.speculate(
                 req_id,
@@ -188,20 +208,24 @@ class SuffixProposer(Proposer):
                 max_spec_factor=self.max_spec_factor,
                 min_token_prob=self.min_token_prob,
             )
-            logger.info(f"req_id: {req_id}, ctx: {ctx}, draft_tokens: {draft}")
-
+            # logger.info(f"bid: {bid}. req_id: {req_id}, ctx: {ctx}, draft_tokens: {draft}")
+            t2 = time.time()
+            logger.info(f"{bid} speculate time: {(t2 - t1)*1000:3.1f}ms")
             token_ids = draft.token_ids
-            n = min(len(token_ids), self.max_draft_token_num)
 
+            n = 0
+            for token in token_ids:
+                if token in self.ban_tokens:
+                    break
+                else:
+                    n += 1
             if n > 0:
-                draft_tokens_cpu[bid, 1 : 1 + n] = paddle.to_tensor(token_ids[:n], dtype="int64")
+                draft_tokens_cpu[bid, 1 : 1 + n] = np.array(token_ids[:n])
                 draft_tokens_cpu[bid, 1 + n :] = -1
-                seq_lens_this_time[bid, 0] = 1 + n
-            else:
-                draft_tokens_cpu[bid, 1:] = -1
+                seq_lens_this_time_cpu[bid] = 1 + n
 
         share_inputs["draft_tokens"][:] = draft_tokens_cpu.cuda()
-        share_inputs["seq_lens_this_time"][:] = seq_lens_this_time.cuda()
+        share_inputs["seq_lens_this_time"][:] = seq_lens_this_time_cpu.cuda()
 
     def _update_request_mapping(self, idx: int, req_id: str):
         """
@@ -212,6 +236,7 @@ class SuffixProposer(Proposer):
             idx: Batch index
         """
         # Clean up old mapping if exists
+        # logger.info(f"update idx: {idx}")
         if idx in self.idx_to_req_id:
             old_req_id = self.idx_to_req_id[idx]
             if old_req_id in self.req_id_to_idx:
@@ -221,4 +246,4 @@ class SuffixProposer(Proposer):
         self.req_id_to_idx[req_id] = idx
         self.idx_to_req_id[idx] = req_id
 
-        logger.info(f"self.req_id_to_idx: {self.req_id_to_idx}, self.idx_to_req_id: {self.idx_to_req_id}")
+        # logger.info(f"self.req_id_to_idx: {self.req_id_to_idx}, self.idx_to_req_id: {self.idx_to_req_id}")

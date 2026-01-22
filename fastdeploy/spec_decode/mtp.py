@@ -987,19 +987,19 @@ class MTPProposer(Proposer):
                 if self.num_model_steps > 1:
                     self.last_seq_lens_this_time.copy_(self.model_inputs["seq_lens_this_time"], False)
 
-                logger.info("======MTP Input =====")
-                logger.info(f'D seq_lens_this_time: {self.model_inputs["seq_lens_this_time"]}')
-                logger.info(f'D seq_lens_encoder: {self.model_inputs["seq_lens_encoder"]}')
-                logger.info(f'D seq_lens_decoder: {self.model_inputs["seq_lens_decoder"]}')
-                logger.info(f'D step_idx: {self.model_inputs["step_idx"]}')
-                logger.info(f'D stop_flags: {self.model_inputs["stop_flags"]}')
-                logger.info(f'D input_ids: {self.model_inputs["input_ids"][:,:35]}')
-                logger.info(f'D draft_tokens: {self.model_inputs["draft_tokens"]}')
-                logger.info(f"D ids_remove_padding({len(ids_remove_padding)}): {ids_remove_padding}")
-                logger.info(f'D attn_mask_offsets: {self.model_inputs["attn_mask_offsets"]}')
-                logger.info(f'D attn_mask_offsets_decoder: {self.model_inputs["attn_mask_offsets_decoder"]}')
+                # logger.info("======MTP Input =====")
+                # logger.info(f'D seq_lens_this_time: {self.model_inputs["seq_lens_this_time"]}')
+                # logger.info(f'D seq_lens_encoder: {self.model_inputs["seq_lens_encoder"]}')
+                # logger.info(f'D seq_lens_decoder: {self.model_inputs["seq_lens_decoder"]}')
+                # logger.info(f'D step_idx: {self.model_inputs["step_idx"]}')
+                # logger.info(f'D stop_flags: {self.model_inputs["stop_flags"]}')
+                # logger.info(f'D input_ids: {self.model_inputs["input_ids"][:,:35]}')
+                # logger.info(f'D draft_tokens: {self.model_inputs["draft_tokens"]}')
+                # logger.info(f"D ids_remove_padding({len(ids_remove_padding)}): {ids_remove_padding}")
+                # logger.info(f'D attn_mask_offsets: {self.model_inputs["attn_mask_offsets"]}')
+                # logger.info(f'D attn_mask_offsets_decoder: {self.model_inputs["attn_mask_offsets_decoder"]}')
 
-                logger.info("==============Fin=====================")
+                # logger.info("==============Fin=====================")
 
                 model_output = self.model(
                     ids_remove_padding=self.model_inputs["ids_remove_padding"],
