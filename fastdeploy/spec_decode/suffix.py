@@ -17,7 +17,6 @@
 import time
 
 import numpy as np
-import paddle
 from paddleformers.utils.log import logger
 
 from fastdeploy.config import FDConfig
@@ -58,11 +57,11 @@ class SuffixProposer(Proposer):
         # Track active requests: req_id -> idx mapping
         self.req_id_to_idx = {}
         self.idx_to_req_id = {}
-        self.context_tokens = paddle.full(
-            shape=[self.max_num_seqs, self.max_model_len],
-            fill_value=-1,
-            dtype="int64",
-        ).cpu()
+        self.context_tokens = np.full(
+            (self.max_num_seqs, self.max_model_len),
+            -1,
+            dtype=np.int32,
+        )
         self.ban_tokens = [101031, 101032, 101033]
 
     def start_request(self, idx: int, req_id: str, prompt_token_ids: list[int]):
@@ -127,13 +126,20 @@ class SuffixProposer(Proposer):
         self.suffix_cache.add_active_response(req_id, token_array)
 
     def _run_impl(self, share_inputs):
+        for bid in range(share_inputs["stop_flags"].shape[0]):
+            if share_inputs["stop_flags"][bid] is False:
+                share_inputs["seq_lens_this_time"][bid : bid + 1, 0] = 1
+            else:
+                share_inputs["seq_lens_this_time"][bid : bid + 1, 0] = 0
+
+    def _run_impl_bakcup(self, share_inputs):
 
         stop_flags_cpu = share_inputs["stop_flags"].cpu().numpy().flatten()
         is_block_step_cpu = share_inputs["is_block_step"].cpu().numpy().flatten()
         accept_tokens_cpu = share_inputs["accept_tokens"].cpu()
         accept_num_cpu = share_inputs["accept_num"].cpu().numpy().flatten()
-        seq_lens_encoder = share_inputs["seq_lens_encoder"].cpu().numpy().flatten().astype(np.int32)
-        seq_lens_decoder = share_inputs["seq_lens_decoder"].cpu().numpy().flatten().astype(np.int32)
+        seq_lens_encoder = share_inputs["seq_lens_encoder"].cpu().numpy().flatten()
+        seq_lens_decoder = share_inputs["seq_lens_decoder"].cpu().numpy().flatten()
 
         draft_tokens_cpu = share_inputs["draft_tokens"].cpu()
         seq_lens_this_time_cpu = share_inputs["seq_lens_this_time"].cpu()
@@ -146,6 +152,7 @@ class SuffixProposer(Proposer):
         # logger.info(f"is_block_step_cpu: {is_block_step_cpu}")
 
         for bid in range(batch_size):
+            t0 = time.time()
 
             req_id = self.idx_to_req_id.get(bid)
             # ---------- 1. stop 优先级最高 ----------
@@ -172,7 +179,7 @@ class SuffixProposer(Proposer):
             if req_id is None:
                 logger.info(f"bid: {bid} req_id: {req_id} skip from None req_id")
                 continue
-
+            t1 = time.time()
             # ---------- 3. accept ----------
             acc_n = int(accept_num_cpu[bid])
 
@@ -183,23 +190,30 @@ class SuffixProposer(Proposer):
                 self.context_tokens[bid, ctx_start : ctx_start + acc_n] = token_ids
                 self.add_active_response(req_id, token_ids)
                 # logger.info(f"accept_tokens_cpu: {token_ids}. self.context_tokens: {self.context_tokens}")
+            t2 = time.time()
 
             # ---------- 5. context ----------
+            t_ctx0 = time.time()
+            # start = max(0, num_tokens - self.max_tree_depth)
             start = max(0, num_tokens - self.max_tree_depth)
-            ctx = self.context_tokens[bid, start:num_tokens].numpy()
-            # logger.info(f"{bid}: {req_id}, match from {start} to {num_tokens}: ctx:{ctx}")
+
+            ctx = self.context_tokens[bid, start:num_tokens]
+            t_ctx1 = time.time()
+
+            # 2. mask
             ctx = ctx[ctx >= 0]
-            # logger.info(f"masked ctx:{ctx}")
+            t_ctx2 = time.time()
 
             if ctx.size == 0:
                 continue
 
+            # 3. contiguous / astype
             if not ctx.flags["CONTIGUOUS"]:
                 ctx = np.ascontiguousarray(ctx, dtype=np.int32)
             else:
                 ctx = ctx.astype(np.int32, copy=False)
-
-            t1 = time.time()
+            t_ctx3 = time.time()
+            t3 = time.time()
             # ---------- 6. speculate ----------
             draft = self.suffix_cache.speculate(
                 req_id,
@@ -209,8 +223,7 @@ class SuffixProposer(Proposer):
                 min_token_prob=self.min_token_prob,
             )
             # logger.info(f"bid: {bid}. req_id: {req_id}, ctx: {ctx}, draft_tokens: {draft}")
-            t2 = time.time()
-            logger.info(f"{bid} speculate time: {(t2 - t1)*1000:3.1f}ms")
+            t4 = time.time()
             token_ids = draft.token_ids
 
             n = 0
@@ -223,7 +236,20 @@ class SuffixProposer(Proposer):
                 draft_tokens_cpu[bid, 1 : 1 + n] = np.array(token_ids[:n])
                 draft_tokens_cpu[bid, 1 + n :] = -1
                 seq_lens_this_time_cpu[bid] = 1 + n
-
+            t5 = time.time()
+            logger.info(
+                f"{bid} t0~t1: {(t1 -t0)*1000:.1f}. t1~t2:{(t2 -t1)*1000:.1f}. t2~t3:{(t3 -t2)*1000:.1f} t3~t4:{(t4 -t3)*1000:.1f} t4~t5:{(t5 -t4)*1000:.1f} all: {(t5 - t0)*1000:.1f}ms"
+            )
+            logger.info(
+                f"[ctx build] bid={bid} "
+                f"slice+numpy: {(t_ctx1 - t_ctx0)*1000:.2f}ms, "
+                f"mask: {(t_ctx2 - t_ctx1)*1000:.2f}ms, "
+                f"contig/astype: {(t_ctx3 - t_ctx2)*1000:.2f}ms, "
+                f"draft_token_ids_len: {len(token_ids)}"
+                f"ctx_len={ctx.size}"
+            )
+        # share_inputs["draft_tokens"].copy_(draft_tokens_cpu.cuda(), False)
+        # share_inputs["seq_lens_this_time"].copy_(seq_lens_this_time_cpu.cuda(), False)
         share_inputs["draft_tokens"][:] = draft_tokens_cpu.cuda()
         share_inputs["seq_lens_this_time"][:] = seq_lens_this_time_cpu.cuda()
 

@@ -744,6 +744,7 @@ class SpeculativeSampler(nn.Layer):
 
         from fastdeploy.model_executor.ops.gpu import speculate_verify, top_p_candidates
 
+        logger.info(f"logits: {logits}")
         logits = apply_speculative_penalty_multi_scores(
             sampling_metadata.pre_token_ids,
             logits,
@@ -779,6 +780,7 @@ class SpeculativeSampler(nn.Layer):
 
         probs = F.softmax(logits)
 
+        logger.info(f"probs.shape: {probs.shape}")
         top_p, top_k, topp_seed = padding_sampling_params(
             sampling_metadata.top_p,
             sampling_metadata.top_k,
@@ -787,7 +789,7 @@ class SpeculativeSampler(nn.Layer):
             share_inputs["seq_lens_encoder"],
         )
         _, sampled_token_ids = top_k_top_p_sampling(probs, top_p=top_p, top_k=top_k, topp_seed=topp_seed)
-
+        logger.info(f"sampled_token_ids: {sampled_token_ids}. scores: {_}")
         verify_scores, verify_tokens, actual_candidate_len = top_p_candidates(
             probs,
             sampling_metadata.top_p,
@@ -824,7 +826,7 @@ class SpeculativeSampler(nn.Layer):
             (self.speculative_benchmark_mode or reject_all_drafts),
             accept_all_drafts,
         )
-
+        logger.info(f'first accept_tokens: {share_inputs["accept_tokens"]}')
         num_logprobs = sampling_metadata.max_num_logprobs
         batch_token_num = None
         if num_logprobs is not None:

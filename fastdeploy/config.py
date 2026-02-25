@@ -730,8 +730,8 @@ class SpeculativeConfig:
         self.max_ngram_size: int = 5
         self.min_ngram_size: int = 2
         # suffix decoding
-        self.suffix_decoding_max_tree_depth: int = 64
-        self.suffix_decoding_max_cached_requests: int = -1
+        self.suffix_decoding_max_tree_depth: int = 100
+        self.suffix_decoding_max_cached_requests: int = 2
         self.suffix_decoding_max_spec_factor: float = 1.0
         self.suffix_decoding_min_token_prob: float = 0.1
         # model for mtp/eagle/draft_model
