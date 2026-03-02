@@ -720,7 +720,7 @@ class SpeculativeConfig:
         self,
         args,
     ):
-        self.method_list = ["ngram_match", "mtp"]
+        self.method_list = ["ngram_match", "mtp", "naive"]
         self.mtp_strategy_list = ["default", "with_ngram"]
 
         # speculative method, choose in [None, "ngram_match", "mtp", "hybrid_mtp_ngram"]
@@ -764,6 +764,22 @@ class SpeculativeConfig:
 
         self.enable_draft_logprob: bool = False
 
+        # Verify strategy: "topk" | "topp" | "target_sampling"
+        # Controls which verification branch to use in speculate_verify kernel.
+        #   "topk"            — Top-1 exact match (was SPECULATE_VERIFY_USE_TOPK env var)
+        #   "topp"            — Top-P candidate set match + Top-P sampling (default)
+        #   "target_sampling" — Compare with target model's sampled token (was SPECULATE_VERIFY_USE_TARGET_SAMPLING env var)
+        self.verify_strategy: str = "topp"
+
+        # Whether to stop after one token during prefill (was PREFILL_NODE_ONE_STEP_STOP env var)
+        self.prefill_one_step_stop: bool = False
+
+        # Accept policy: "normal" | "accept_all" | "reject_all"
+        #   "normal"     — Normal verification flow (default)
+        #   "accept_all" — Force accept all draft tokens (debug/test)
+        #   "reject_all" — Force reject all draft tokens (debug/test/benchmark)
+        self.accept_policy: str = "normal"
+
         for key, value in args.items():
             if hasattr(self, key):
                 setattr(self, key, value)
@@ -805,6 +821,14 @@ class SpeculativeConfig:
         if self.method in ["mtp"]:
             self.num_extra_cache_layer = 1
 
+        # Backward compatibility: env vars override config for verify strategy
+        if os.environ.get("SPECULATE_VERIFY_USE_TOPK", "0") == "1":
+            self.verify_strategy = "topk"
+        if os.environ.get("SPECULATE_VERIFY_USE_TARGET_SAMPLING", "0") == "1":
+            self.verify_strategy = "target_sampling"
+        if os.environ.get("PREFILL_NODE_ONE_STEP_STOP", "0") == "1":
+            self.prefill_one_step_stop = True
+
     def enabled_speculative_decoding(self):
         """
         Check if speculative decoding is enabled.
@@ -838,12 +862,13 @@ class SpeculativeConfig:
                 self.method in self.method_list
             ), f"speculative method only support {self.method_list} now, but get {self.method}."
 
-            assert (
-                self.num_speculative_tokens >= 1 and self.num_speculative_tokens <= 5
-            ), f"num_speculative_tokens only support in range[1, 5], but get {self.num_speculative_tokens}."
-            assert (
-                self.num_model_steps >= 1 and self.num_model_steps <= 5
-            ), f"num_model_steps only support in range[1, 5], but get {self.num_model_steps}."
+            if self.method != "naive":
+                assert (
+                    self.num_speculative_tokens >= 1 and self.num_speculative_tokens <= 5
+                ), f"num_speculative_tokens only support in range[1, 5], but get {self.num_speculative_tokens}."
+                assert (
+                    self.num_model_steps >= 1 and self.num_model_steps <= 5
+                ), f"num_model_steps only support in range[1, 5], but get {self.num_model_steps}."
 
             if self.method in ["mtp", "hybrid_mtp_ngram"]:
                 if self.num_speculative_tokens < self.num_model_steps:
@@ -855,6 +880,17 @@ class SpeculativeConfig:
             assert (
                 self.mtp_strategy in self.mtp_strategy_list
             ), f"mtp_strategy_list only support {self.mtp_strategy_list}, but get {self.mtp_strategy}"
+
+            # Validate verify strategy and accept policy
+            valid_verify_strategies = ["topk", "topp", "target_sampling"]
+            assert (
+                self.verify_strategy in valid_verify_strategies
+            ), f"verify_strategy only support {valid_verify_strategies}, but get {self.verify_strategy}."
+
+            valid_accept_policies = ["normal", "accept_all", "reject_all"]
+            assert (
+                self.accept_policy in valid_accept_policies
+            ), f"accept_policy only support {valid_accept_policies}, but get {self.accept_policy}."
 
     def __str__(self) -> str:
         return self.to_json_string()
@@ -1456,21 +1492,31 @@ class CacheConfig:
         """
         calculate block num
         """
+        # 计算解码token数量 = 编码解码块数 * 块大小
         self.dec_token_num = self.enc_dec_block_num * self.block_size
+
+        # 分支1: 如果设置了GPU块数覆盖值
         if self.num_gpu_blocks_override is not None:
             self.total_block_num = self.num_gpu_blocks_override
+            # 根据是否启用V1调度器决定预填充KV缓存块数
             if envs.ENABLE_V1_KVCACHE_SCHEDULER:
                 self.prefill_kvcache_block_num = self.total_block_num
             else:
                 self.prefill_kvcache_block_num = int(self.total_block_num * self.kv_cache_ratio)
+
+            # 验证预填充KV缓存块数是否足够
             assert self.prefill_kvcache_block_num >= self.max_block_num_per_seq + self.enc_dec_block_num, (
                 f"prefill_kvcache_block_num: {self.prefill_kvcache_block_num} should be larger "
                 f"than or equal to {self.max_block_num_per_seq + self.enc_dec_block_num}, please reduce "
                 "the max_model_len or increase num_gpu_blocks_override"
             )
+        # 分支2: 未设置覆盖值时动态计算块数
         else:
+            # 计算平均每个任务的token长度
             length = num_total_tokens // number_of_tasks
+            # 计算每个任务需要的块数 = (长度 + 块大小-1 + 解码token数) / 块大小
             block_num = (length + self.block_size - 1 + self.dec_token_num) // self.block_size
+            # 总块数 = 每个任务块数 * 任务数
             self.total_block_num = block_num * number_of_tasks
             self.prefill_kvcache_block_num = self.total_block_num
             logger.info(f"Doing profile, the total_block_num:{self.total_block_num}")

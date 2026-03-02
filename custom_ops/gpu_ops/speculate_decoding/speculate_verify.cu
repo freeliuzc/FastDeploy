@@ -12,10 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Refactored speculate_verify kernel:
+// - Eliminated template parameters (ENABLE_TOPP x USE_TOPK) → runtime bools
+// - Removed per-call getenv() reads → parameters passed from Python config
+// - Persistent curand state allocation → no more cudaMalloc/cudaFree per call
+// - Extracted device helper functions for clarity
+
 #include <curand_kernel.h>
-#include <cstdlib>
-#include <string>
 #include "helper.h"  // NOLINT
+
+// Persistent curand state — allocated once, reused across calls
+static curandState_t *dev_curand_states = nullptr;
+static int allocated_bsz = 0;
+static uint64_t seed = 0;
+static uint64_t offset = 0;
 
 __device__ inline bool is_in(const int64_t *candidates,
                              const int64_t draft,
@@ -28,18 +38,15 @@ __device__ inline bool is_in(const int64_t *candidates,
   return false;
 }
 
-static uint64_t seed = 0;
-static uint64_t offset = 0;
-
 __device__ int64_t topp_sampling_kernel(const int64_t *candidate_ids,
                                         const float *candidate_scores,
-                                        curandState_t *dev_curand_states,
+                                        curandState_t *curand_states,
                                         const int candidate_len,
                                         const float topp) {
   const int tid = threadIdx.x;
 
   float sum_scores = 0.0f;
-  float rand_top_p = curand_uniform(dev_curand_states + tid) * topp;
+  float rand_top_p = curand_uniform(curand_states + tid) * topp;
   for (int i = 0; i < candidate_len; i++) {
     sum_scores += candidate_scores[i];
     if (rand_top_p <= sum_scores) {
@@ -64,155 +71,146 @@ __global__ void setup_kernel(curandState_t *state,
   }
 }
 
-template <bool ENABLE_TOPP, bool USE_TOPK>
-__global__ void speculate_verify(const int64_t *sampled_token_ids,
-                                 int64_t *accept_tokens,
-                                 int *accept_num,
-                                 int64_t *step_idx,
-                                 bool *stop_flags,
-                                 const int *seq_lens_encoder,
-                                 const int *seq_lens_decoder,
-                                 const int64_t *draft_tokens,
-                                 const int *actual_draft_token_nums,
-                                 curandState_t *dev_curand_states,
-                                 const float *topp,
-                                 const int *seq_lens_this_time,
-                                 const int64_t *verify_tokens,
-                                 const float *verify_scores,
-                                 const int64_t *max_dec_len,
-                                 const int64_t *end_tokens,
-                                 const bool *is_block_step,
-                                 const int *cu_seqlens_q_output,
-                                 const int *actual_candidate_len,
-                                 const int *reasoning_status,
-                                 const int real_bsz,
-                                 const int max_draft_tokens,
-                                 const int end_length,
-                                 const int max_seq_len,
-                                 const int max_candidate_len,
-                                 const int verify_window,
-                                 const bool prefill_one_step_stop,
-                                 const bool benchmark_mode,
-                                 const bool accept_all_drafts,
-                                 const bool use_target_sampling) {
+// Helper: accept a draft token and check stop conditions.
+// Returns true if the sequence should stop after this acceptance.
+__device__ inline bool accept_and_check_stop(int bid,
+                                             int i,
+                                             int64_t accept_token,
+                                             int64_t *accept_tokens,
+                                             int64_t *step_idx,
+                                             bool *stop_flags,
+                                             const int64_t *max_dec_len,
+                                             const int64_t *end_tokens,
+                                             int end_length,
+                                             int max_draft_tokens,
+                                             int &stop_flag_now_int) {
+  step_idx[bid]++;
+  accept_tokens[bid * max_draft_tokens + i] = accept_token;
+
+  if (is_in_end(accept_token, end_tokens, end_length) ||
+      step_idx[bid] >= max_dec_len[bid]) {
+    stop_flags[bid] = true;
+    stop_flag_now_int = 1;
+    if (step_idx[bid] >= max_dec_len[bid])
+      accept_tokens[bid * max_draft_tokens + i] = end_tokens[0];
+    return true;  // stopped
+  }
+  return false;  // continue
+}
+
+// Single non-templated kernel — runtime bools replace template parameters.
+// Since this kernel runs <<<1, BlockSize>>> (one thread per batch element),
+// the branch overhead from runtime bools is negligible.
+__global__ void speculate_verify(
+    const int64_t *sampled_token_ids,
+    int64_t *accept_tokens,
+    int *accept_num,
+    int64_t *step_idx,
+    bool *stop_flags,
+    const int *seq_lens_encoder,
+    const int *seq_lens_decoder,
+    const int64_t *draft_tokens,
+    const int *actual_draft_token_nums,
+    curandState_t *curand_states,
+    const float *topp,
+    const int *seq_lens_this_time,
+    const int64_t *verify_tokens,
+    const float *verify_scores,
+    const int64_t *max_dec_len,
+    const int64_t *end_tokens,
+    const bool *is_block_step,
+    const int *cu_seqlens_q_output,
+    const int *actual_candidate_len,
+    const int *reasoning_status,
+    const int real_bsz,
+    const int max_bsz,
+    const int max_draft_tokens,
+    const int end_length,
+    const int max_seq_len,
+    const int max_candidate_len,
+    const int verify_window,
+    // Strategy parameters (from SpeculativeConfig, no longer from env vars)
+    const bool enable_topp,
+    const bool use_topk,
+    const bool use_target_sampling,
+    const bool benchmark_mode,
+    const bool accept_all_drafts,
+    const bool prefill_one_step_stop) {
   const int bid = threadIdx.x;
-  // verify and set stop flags
   int accept_num_now = 1;
   int stop_flag_now_int = 0;
+
+  // Initialize accept_num to 0 for ALL slots (0..max_bsz), including slots
+  // beyond real_bsz that may have stale data from previous rounds.
+  // Active sequences will overwrite this with the correct value below.
+  // This replaces the accept_num=0 cleanup that was in
+  // speculate_set_value_by_flags_and_idx.
+  if (bid < max_bsz) {
+    accept_num[bid] = 0;
+  }
 
   if (!(is_block_step[bid] || bid >= real_bsz)) {
     const int start_token_id = cu_seqlens_q_output[bid];
 
     if (stop_flags[bid]) {
       stop_flag_now_int = 1;
-    } else {  // 这里prefill阶段也会进入，但是因为draft
-              // tokens会置零，因此会直接到最后的采样阶段
+    } else {
       auto *verify_tokens_now =
           verify_tokens + start_token_id * max_candidate_len;
       auto *draft_tokens_now = draft_tokens + bid * max_draft_tokens;
       auto *actual_candidate_len_now = actual_candidate_len + start_token_id;
       auto *sampled_token_id_now = sampled_token_ids + start_token_id;
 
+      // Phase 1: Verify draft tokens one by one
       int i = 0;
-      // printf("seq_lens_this_time[%d]-1: %d \n",bid,
-      // seq_lens_this_time[bid]-1);
       for (; i < seq_lens_this_time[bid] - 1; i++) {
         if (benchmark_mode || seq_lens_encoder[bid] != 0 ||
             reasoning_status[bid] == 1) {
           break;
         }
+
+        bool accepted = false;
+
         if (accept_all_drafts) {
-          // accept all draft tokens
-          step_idx[bid]++;
-          auto accept_token = draft_tokens_now[i + 1];
-          accept_tokens[bid * max_draft_tokens + i] = accept_token;
-
-          if (is_in_end(accept_token, end_tokens, end_length) ||
-              step_idx[bid] >= max_dec_len[bid]) {
-            stop_flags[bid] = true;
-            stop_flag_now_int = 1;
-            if (step_idx[bid] >= max_dec_len[bid])
-              accept_tokens[bid * max_draft_tokens + i] = end_tokens[0];
-            break;
-          } else {
-            accept_num_now++;
+          // Force accept all draft tokens
+          if (accept_and_check_stop(bid,
+                                    i,
+                                    draft_tokens_now[i + 1],
+                                    accept_tokens,
+                                    step_idx,
+                                    stop_flags,
+                                    max_dec_len,
+                                    end_tokens,
+                                    end_length,
+                                    max_draft_tokens,
+                                    stop_flag_now_int)) {
+            break;  // stopped
           }
+          accept_num_now++;
           continue;
-        }
-        if (use_target_sampling) {
-          if (sampled_token_id_now[i] == draft_tokens_now[i + 1]) {
-            step_idx[bid]++;
-            auto accept_token = draft_tokens_now[i + 1];
-            accept_tokens[bid * max_draft_tokens + i] = accept_token;
-            if (is_in_end(accept_token, end_tokens, end_length) ||
-                step_idx[bid] >= max_dec_len[bid]) {
-              stop_flags[bid] = true;
-              stop_flag_now_int = 1;
-              if (step_idx[bid] >= max_dec_len[bid])
-                accept_tokens[bid * max_draft_tokens + i] = end_tokens[0];
-              break;
-            } else {
-              accept_num_now++;
-            }
-          } else {
-            break;
-          }
-        } else if (USE_TOPK) {
-          if (verify_tokens_now[i * max_candidate_len] ==
-              draft_tokens_now[i + 1]) {
-            // accept_num_now++;
-            step_idx[bid]++;
-            auto accept_token = draft_tokens_now[i + 1];
-            // printf("[USE_TOPK] bid %d Top 1 verify write accept
-            // %d is %lld\n", bid, i, accept_token);
-            accept_tokens[bid * max_draft_tokens + i] = accept_token;
-            if (is_in_end(accept_token, end_tokens, end_length) ||
-                step_idx[bid] >= max_dec_len[bid]) {
-              stop_flags[bid] = true;
-              stop_flag_now_int = 1;
-              if (step_idx[bid] >= max_dec_len[bid])
-                accept_tokens[bid * max_draft_tokens + i] = end_tokens[0];
-              // printf("[USE_TOPK] bid %d Top 1 verify write
-              // accept %d is %lld\n", bid, i, accept_token);
-              break;
-            } else {
-              accept_num_now++;
-            }
-          } else {
-            break;
-          }
+        } else if (use_target_sampling) {
+          // Target sampling: compare sampled token with draft token
+          accepted = (sampled_token_id_now[i] == draft_tokens_now[i + 1]);
+        } else if (use_topk) {
+          // Top-K: check if top-1 verify token matches draft
+          accepted = (verify_tokens_now[i * max_candidate_len] ==
+                      draft_tokens_now[i + 1]);
         } else {
-          auto actual_candidate_len_value =
-              actual_candidate_len_now[i] > max_candidate_len
-                  ? max_candidate_len
-                  : actual_candidate_len_now[i];
-          if (is_in(verify_tokens_now + i * max_candidate_len,
-                    draft_tokens_now[i + 1],
-                    actual_candidate_len_value)) {
-            // Top P verify
-            // accept_num_now++;
-            step_idx[bid]++;
-            auto accept_token = draft_tokens_now[i + 1];
-            accept_tokens[bid * max_draft_tokens + i] = accept_token;
+          // Top-P: check if draft is in candidate set
+          auto actual_cand_len = actual_candidate_len_now[i] > max_candidate_len
+                                     ? max_candidate_len
+                                     : actual_candidate_len_now[i];
+          accepted = is_in(verify_tokens_now + i * max_candidate_len,
+                           draft_tokens_now[i + 1],
+                           actual_cand_len);
 
-            if (is_in_end(accept_token, end_tokens, end_length) ||
-                step_idx[bid] >= max_dec_len[bid]) {
-              stop_flags[bid] = true;
-              stop_flag_now_int = 1;
-              if (step_idx[bid] >= max_dec_len[bid])
-                accept_tokens[bid * max_draft_tokens + i] = end_tokens[0];
-              // printf("bid %d Top P verify write accept %d is
-              // %lld\n", bid, i, accept_token);
-              break;
-            } else {
-              accept_num_now++;
-            }
-          } else {
-            // TopK verify
+          if (!accepted) {
+            // Top-K verify_window fallback: if top-2 matches, check
+            // verify_window consecutive top-1 matches ahead
             int ii = i;
             if (max_candidate_len >= 2 &&
                 verify_tokens_now[ii * max_candidate_len + 1] ==
-                    draft_tokens_now[ii + 1]) {  // top-2
+                    draft_tokens_now[ii + 1]) {  // top-2 match
               int j = 0;
               ii += 1;
               for (; j < verify_window && ii < seq_lens_this_time[bid] - 1;
@@ -222,28 +220,19 @@ __global__ void speculate_verify(const int64_t *sampled_token_ids,
                   break;
                 }
               }
-              if (j >= verify_window) {  // accept all
+              if (j >= verify_window) {
+                // Bulk accept: top-2 + verify_window consecutive top-1 matches
                 accept_num_now += verify_window + 1;
                 step_idx[bid] += verify_window + 1;
                 for (; i < ii; i++) {
                   auto accept_token = draft_tokens_now[i + 1];
                   accept_tokens[bid * max_draft_tokens + i] = accept_token;
-                  // printf(
-                  //     "bid %d TopK verify write accept %d
-                  //     is "
-                  //     "%lld\n",
-                  //     bid,
-                  //     i,
-                  //     accept_token);
                   if (is_in_end(accept_token, end_tokens, end_length) ||
                       step_idx[bid] >= max_dec_len[bid]) {
                     stop_flags[bid] = true;
                     stop_flag_now_int = 1;
                     if (step_idx[bid] >= max_dec_len[bid])
                       accept_tokens[bid * max_draft_tokens + i] = end_tokens[0];
-                    // printf("bid %d TopK verify write
-                    // accept %d is %lld\n", bid, i,
-                    // end_tokens[0]);
                     accept_num_now--;
                     step_idx[bid]--;
                     break;
@@ -251,37 +240,55 @@ __global__ void speculate_verify(const int64_t *sampled_token_ids,
                 }
               }
             }
-            break;
+            break;  // reject: exit verify loop
           }
         }
+
+        if (accepted) {
+          if (accept_and_check_stop(bid,
+                                    i,
+                                    draft_tokens_now[i + 1],
+                                    accept_tokens,
+                                    step_idx,
+                                    stop_flags,
+                                    max_dec_len,
+                                    end_tokens,
+                                    end_length,
+                                    max_draft_tokens,
+                                    stop_flag_now_int)) {
+            break;  // stopped
+          }
+          accept_num_now++;
+        } else {
+          break;  // reject: exit verify loop
+        }
       }
-      // sampling阶段
-      // 第一种，draft_token[i+1]被拒绝，需要从verify_tokens_now[i]中选一个
-      // 第二种，i == seq_lens_this_time[bid]-1,
-      // 也是从verify_tokens_now[i]中选一个 但是停止的情况不算
+
+      // Phase 2: Sample a token for the rejected/last position
       if (!stop_flag_now_int) {
         int64_t accept_token;
         const float *verify_scores_now =
             verify_scores + start_token_id * max_candidate_len;
         step_idx[bid]++;
+
         if (use_target_sampling) {
           accept_token = sampled_token_id_now[i];
-        } else if (ENABLE_TOPP) {
-          auto actual_candidate_len_value =
-              actual_candidate_len_now[i] > max_candidate_len
-                  ? max_candidate_len
-                  : actual_candidate_len_now[i];
-
+        } else if (enable_topp) {
+          auto actual_cand_len = actual_candidate_len_now[i] > max_candidate_len
+                                     ? max_candidate_len
+                                     : actual_candidate_len_now[i];
           accept_token =
               topp_sampling_kernel(verify_tokens_now + i * max_candidate_len,
                                    verify_scores_now + i * max_candidate_len,
-                                   dev_curand_states,
-                                   actual_candidate_len_value,
+                                   curand_states,
+                                   actual_cand_len,
                                    topp[bid]);
         } else {
           accept_token = verify_tokens_now[i * max_candidate_len];
         }
+
         accept_tokens[bid * max_draft_tokens + i] = accept_token;
+
         if (prefill_one_step_stop) {
           stop_flags[bid] = true;
         }
@@ -321,8 +328,10 @@ void SpeculateVerify(const paddle::Tensor &sampled_token_ids,
                      int verify_window,
                      bool enable_topp,
                      bool benchmark_mode,
-                     bool accept_all_drafts) {
-  //   printf("Enter speculate update\n");
+                     bool accept_all_drafts,
+                     bool use_topk,
+                     bool use_target_sampling,
+                     bool prefill_one_step_stop) {
   auto bsz = accept_tokens.shape()[0];
   int real_bsz = seq_lens_this_time.shape()[0];
   auto max_draft_tokens = draft_tokens.shape()[1];
@@ -330,168 +339,54 @@ void SpeculateVerify(const paddle::Tensor &sampled_token_ids,
   auto max_candidate_len = verify_tokens.shape()[1];
 
   constexpr int BlockSize = 512;
+  auto stream = accept_tokens.stream();
 
-  curandState_t *dev_curand_states;
-  cudaMalloc(&dev_curand_states, sizeof(curandState_t) * bsz);
-  setup_kernel<<<1, BlockSize, 0, accept_tokens.stream()>>>(
+  // Persistent curand state: allocate once, reuse across calls
+  if (dev_curand_states == nullptr || bsz > allocated_bsz) {
+    if (dev_curand_states) cudaFree(dev_curand_states);
+    cudaMalloc(&dev_curand_states, sizeof(curandState_t) * bsz);
+    allocated_bsz = bsz;
+  }
+  setup_kernel<<<1, BlockSize, 0, stream>>>(
       dev_curand_states, seed, offset, bsz, true);
   seed++;
   offset++;
 
-  bool use_topk = false;
-  char *env_var = getenv("SPECULATE_VERIFY_USE_TOPK");
-  if (env_var) {
-    use_topk = static_cast<bool>(std::stoi(env_var));
-  }
-  bool use_target_sampling = false;
-  char *env_var_1 = getenv("SPECULATE_VERIFY_USE_TARGET_SAMPLING");
-  if (env_var_1) {
-    use_target_sampling = static_cast<bool>(std::stoi(env_var_1));
-  }
-  bool prefill_one_step_stop = false;
-  if (const char *env_p = std::getenv("PREFILL_NODE_ONE_STEP_STOP")) {
-    if (env_p[0] == '1') {
-      prefill_one_step_stop = true;
-    }
-  }
-  if (use_topk) {
-    if (enable_topp) {
-      speculate_verify<true, true><<<1, BlockSize, 0, accept_tokens.stream()>>>(
-          sampled_token_ids.data<int64_t>(),
-          const_cast<int64_t *>(accept_tokens.data<int64_t>()),
-          const_cast<int *>(accept_num.data<int>()),
-          const_cast<int64_t *>(step_idx.data<int64_t>()),
-          const_cast<bool *>(stop_flags.data<bool>()),
-          seq_lens_encoder.data<int>(),
-          seq_lens_decoder.data<int>(),
-          draft_tokens.data<int64_t>(),
-          actual_draft_token_nums.data<int>(),
-          dev_curand_states,
-          topp.data<float>(),
-          seq_lens_this_time.data<int>(),
-          verify_tokens.data<int64_t>(),
-          verify_scores.data<float>(),
-          max_dec_len.data<int64_t>(),
-          end_tokens.data<int64_t>(),
-          is_block_step.data<bool>(),
-          cu_seqlens_q_output.data<int>(),
-          actual_candidate_len.data<int>(),
-          reasoning_status.data<int>(),
-          real_bsz,
-          max_draft_tokens,
-          end_length,
-          max_seq_len,
-          max_candidate_len,
-          verify_window,
-          prefill_one_step_stop,
-          benchmark_mode,
-          accept_all_drafts,
-          use_target_sampling);
-    } else {
-      speculate_verify<false, true>
-          <<<1, BlockSize, 0, accept_tokens.stream()>>>(
-              sampled_token_ids.data<int64_t>(),
-              const_cast<int64_t *>(accept_tokens.data<int64_t>()),
-              const_cast<int *>(accept_num.data<int>()),
-              const_cast<int64_t *>(step_idx.data<int64_t>()),
-              const_cast<bool *>(stop_flags.data<bool>()),
-              seq_lens_encoder.data<int>(),
-              seq_lens_decoder.data<int>(),
-              draft_tokens.data<int64_t>(),
-              actual_draft_token_nums.data<int>(),
-              dev_curand_states,
-              topp.data<float>(),
-              seq_lens_this_time.data<int>(),
-              verify_tokens.data<int64_t>(),
-              verify_scores.data<float>(),
-              max_dec_len.data<int64_t>(),
-              end_tokens.data<int64_t>(),
-              is_block_step.data<bool>(),
-              cu_seqlens_q_output.data<int>(),
-              actual_candidate_len.data<int>(),
-              reasoning_status.data<int>(),
-              real_bsz,
-              max_draft_tokens,
-              end_length,
-              max_seq_len,
-              max_candidate_len,
-              verify_window,
-              prefill_one_step_stop,
-              benchmark_mode,
-              accept_all_drafts,
-              use_target_sampling);
-    }
-  } else {
-    if (enable_topp) {
-      speculate_verify<true, false>
-          <<<1, BlockSize, 0, accept_tokens.stream()>>>(
-              sampled_token_ids.data<int64_t>(),
-              const_cast<int64_t *>(accept_tokens.data<int64_t>()),
-              const_cast<int *>(accept_num.data<int>()),
-              const_cast<int64_t *>(step_idx.data<int64_t>()),
-              const_cast<bool *>(stop_flags.data<bool>()),
-              seq_lens_encoder.data<int>(),
-              seq_lens_decoder.data<int>(),
-              draft_tokens.data<int64_t>(),
-              actual_draft_token_nums.data<int>(),
-              dev_curand_states,
-              topp.data<float>(),
-              seq_lens_this_time.data<int>(),
-              verify_tokens.data<int64_t>(),
-              verify_scores.data<float>(),
-              max_dec_len.data<int64_t>(),
-              end_tokens.data<int64_t>(),
-              is_block_step.data<bool>(),
-              cu_seqlens_q_output.data<int>(),
-              actual_candidate_len.data<int>(),
-              reasoning_status.data<int>(),
-              real_bsz,
-              max_draft_tokens,
-              end_length,
-              max_seq_len,
-              max_candidate_len,
-              verify_window,
-              prefill_one_step_stop,
-              benchmark_mode,
-              accept_all_drafts,
-              use_target_sampling);
-    } else {
-      speculate_verify<false, false>
-          <<<1, BlockSize, 0, accept_tokens.stream()>>>(
-              sampled_token_ids.data<int64_t>(),
-              const_cast<int64_t *>(accept_tokens.data<int64_t>()),
-              const_cast<int *>(accept_num.data<int>()),
-              const_cast<int64_t *>(step_idx.data<int64_t>()),
-              const_cast<bool *>(stop_flags.data<bool>()),
-              seq_lens_encoder.data<int>(),
-              seq_lens_decoder.data<int>(),
-              draft_tokens.data<int64_t>(),
-              actual_draft_token_nums.data<int>(),
-              dev_curand_states,
-              topp.data<float>(),
-              seq_lens_this_time.data<int>(),
-              verify_tokens.data<int64_t>(),
-              verify_scores.data<float>(),
-              max_dec_len.data<int64_t>(),
-              end_tokens.data<int64_t>(),
-              is_block_step.data<bool>(),
-              cu_seqlens_q_output.data<int>(),
-              actual_candidate_len.data<int>(),
-              reasoning_status.data<int>(),
-              real_bsz,
-              max_draft_tokens,
-              end_length,
-              max_seq_len,
-              max_candidate_len,
-              verify_window,
-              prefill_one_step_stop,
-              benchmark_mode,
-              accept_all_drafts,
-              use_target_sampling);
-    }
-  }
-
-  cudaFree(dev_curand_states);
+  // Single kernel launch — no more 4-way template dispatch
+  speculate_verify<<<1, BlockSize, 0, stream>>>(
+      sampled_token_ids.data<int64_t>(),
+      const_cast<int64_t *>(accept_tokens.data<int64_t>()),
+      const_cast<int *>(accept_num.data<int>()),
+      const_cast<int64_t *>(step_idx.data<int64_t>()),
+      const_cast<bool *>(stop_flags.data<bool>()),
+      seq_lens_encoder.data<int>(),
+      seq_lens_decoder.data<int>(),
+      draft_tokens.data<int64_t>(),
+      actual_draft_token_nums.data<int>(),
+      dev_curand_states,
+      topp.data<float>(),
+      seq_lens_this_time.data<int>(),
+      verify_tokens.data<int64_t>(),
+      verify_scores.data<float>(),
+      max_dec_len.data<int64_t>(),
+      end_tokens.data<int64_t>(),
+      is_block_step.data<bool>(),
+      cu_seqlens_q_output.data<int>(),
+      actual_candidate_len.data<int>(),
+      reasoning_status.data<int>(),
+      real_bsz,
+      bsz,  // max_bsz
+      max_draft_tokens,
+      end_length,
+      max_seq_len,
+      max_candidate_len,
+      verify_window,
+      enable_topp,
+      use_topk,
+      use_target_sampling,
+      benchmark_mode,
+      accept_all_drafts,
+      prefill_one_step_stop);
 }
 
 PD_BUILD_STATIC_OP(speculate_verify)
@@ -522,7 +417,10 @@ PD_BUILD_STATIC_OP(speculate_verify)
             "verify_window: int",
             "enable_topp: bool",
             "benchmark_mode: bool",
-            "accept_all_drafts: bool"})
+            "accept_all_drafts: bool",
+            "use_topk: bool",
+            "use_target_sampling: bool",
+            "prefill_one_step_stop: bool"})
     .SetInplaceMap({{"accept_tokens", "accept_tokens_out"},
                     {"accept_num", "accept_num_out"},
                     {"step_idx", "step_idx_out"},

@@ -224,6 +224,7 @@ if paddle.is_compiled_with_rocm():
         "gpu_ops/speculate_decoding/speculate_step.cu",
         "gpu_ops/speculate_decoding/speculate_step_system_cache.cu",
         "gpu_ops/speculate_decoding/speculate_update_v3.cu",
+        "gpu_ops/speculate_decoding/unified_update_model_status.cu",
         "gpu_ops/get_position_ids_and_mask_encoder_batch.cu",
         "gpu_ops/fused_rotary_position_encoding.cu",
         "gpu_ops/step_reschedule.cu",

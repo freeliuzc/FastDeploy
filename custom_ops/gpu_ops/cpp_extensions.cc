@@ -798,7 +798,10 @@ void SpeculateVerify(const paddle::Tensor& sampled_token_ids,
                      int verify_window,
                      bool enable_topp,
                      bool benchmark_mode,
-                     bool accept_all_drafts);
+                     bool accept_all_drafts,
+                     bool use_topk,
+                     bool use_target_sampling,
+                     bool prefill_one_step_stop);
 
 void SpeculateUpdate(const paddle::Tensor& seq_lens_encoder,
                      const paddle::Tensor& seq_lens_decoder,
@@ -811,6 +814,21 @@ void SpeculateUpdate(const paddle::Tensor& seq_lens_encoder,
                      const paddle::Tensor& seq_lens_this_time,
                      const paddle::Tensor& is_block_step,
                      const paddle::Tensor& mask_rollback);
+
+void UnifiedUpdateModelStatus(const paddle::Tensor& seq_lens_encoder,
+                              const paddle::Tensor& seq_lens_decoder,
+                              const paddle::Tensor& has_running_seqs,
+                              const paddle::Tensor& step_input_ids,
+                              const paddle::Tensor& adaptive_step_input_len,
+                              const paddle::Tensor& step_output_ids,
+                              const paddle::Tensor& step_output_len,
+                              const paddle::Tensor& stop_flags,
+                              const paddle::Tensor& seq_lens_this_time,
+                              const paddle::Tensor& is_paused,
+                              const paddle::Tensor& mask_rollback,
+                              const paddle::Tensor& pre_ids,
+                              const paddle::Tensor& step_idx,
+                              const bool is_naive_mode);
 
 void SpeculateSetValueByFlagsAndIdx(const paddle::Tensor& pre_ids_all,
                                     const paddle::Tensor& accept_tokens,
@@ -1619,6 +1637,10 @@ PYBIND11_MODULE(fastdeploy_ops, m) {
   m.def("speculate_verify", &SpeculateVerify, "speculate_verify function");
 
   m.def("speculate_update", &SpeculateUpdate, "Speculate Update Kernel");
+
+  m.def("unified_update_model_status",
+        &UnifiedUpdateModelStatus,
+        "unified_update_model_status function");
 
   m.def("speculate_set_value_by_flags_and_idx",
         &SpeculateSetValueByFlagsAndIdx,

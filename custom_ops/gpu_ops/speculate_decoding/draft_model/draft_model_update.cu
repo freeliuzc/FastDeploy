@@ -77,13 +77,14 @@ __global__ void draft_model_update_kernel(const int64_t* inter_next_tokens,
         base_model_draft_tokens_now[substep + 1] = token_this_time;
       }
 
-      // multi_end
-      if (is_in_end(token_this_time, end_ids, end_ids_len) ||
-          prefill_one_step_stop) {
-        stop_flags[tid] = true;
-        stop_flag_now_int = 1;
-        // max_dec_len
-      } else if (step_idx[tid] >= max_dec_len[tid]) {
+      // multi_end don't check eos
+      // if (is_in_end(token_this_time, end_ids, end_ids_len) ||
+      //     prefill_one_step_stop) {
+      //   stop_flags[tid] = true;
+      //   stop_flag_now_int = 1;
+      //   // max_dec_len
+      // }
+      if (step_idx[tid] >= max_dec_len[tid]) {
         stop_flags[tid] = true;
         draft_token_now[seq_len_this_time - 1] = end_ids[0];
         base_model_draft_tokens_now[substep + 1] = end_ids[0];

@@ -69,14 +69,13 @@ elif current_platform.is_maca():
         speculate_save_output,
         speculate_save_output_topk,
         speculate_set_stop_value_multi_seqs,
-        speculate_set_value_by_flags_and_idx,
         speculate_step_paddle,
         speculate_step_reschedule,
         speculate_step_system_cache,
-        speculate_update,
         step_paddle,
         step_reschedule,
         step_system_cache,
+        unified_update_model_status,
         update_inputs,
         update_inputs_v1,
     )
@@ -91,11 +90,10 @@ else:
         speculate_get_seq_lens_output,
         speculate_save_output,
         speculate_save_output_topk,
-        speculate_set_value_by_flags_and_idx,
         speculate_step_paddle,
         speculate_step_system_cache,
-        speculate_update,
         speculate_set_stop_value_multi_seqs,
+        unified_update_model_status,
         step_paddle,
         step_system_cache,
         update_inputs,
@@ -482,6 +480,7 @@ def post_process_specualate(
     think_end_id: int = -1,
     line_break_id: int = -1,
     enable_entropy: bool = False,
+    is_naive_mode: bool = False,
 ):
     if think_end_id > 0:
         speculate_limit_thinking_content_length(
@@ -512,18 +511,25 @@ def post_process_specualate(
     if enable_entropy:
         speculate_calculate_logits_entropy(sampler_output.logits, share_inputs, sampling_metadata.temperature)
 
-    speculate_update(
-        model_output.seq_lens_encoder,
-        model_output.seq_lens_decoder,
-        model_output.not_need_stop,
-        model_output.draft_tokens,
-        model_output.actual_draft_token_num,
-        model_output.accept_tokens,
-        model_output.accept_num,
-        model_output.stop_flags,
-        model_output.seq_lens_this_time,
-        model_output.is_block_step,
-        model_output.mask_rollback,
+    # Unified state update: merges speculate_update + speculate_set_value_by_flags_and_idx
+    # into a single kernel launch. step_output_ids/step_output_len are READ-ONLY here,
+    # so save_output can safely read them afterward.
+
+    unified_update_model_status(
+        model_output.seq_lens_encoder,  # seq_lens_encoder
+        model_output.seq_lens_decoder,  # seq_lens_decoder
+        model_output.not_need_stop,  # has_running_seqs
+        model_output.draft_tokens,  # step_input_ids
+        model_output.actual_draft_token_num,  # adaptive_step_input_len
+        model_output.accept_tokens,  # step_output_ids (read-only)
+        model_output.accept_num,  # step_output_len (read-only)
+        model_output.stop_flags,  # stop_flags
+        model_output.seq_lens_this_time,  # seq_lens_this_time
+        model_output.is_block_step,  # is_paused
+        model_output.mask_rollback,  # mask_rollback
+        model_output.pre_ids,  # pre_ids
+        model_output.step_idx,  # step_idx
+        is_naive_mode,  # is_naive_mode
     )
 
     if not skip_save_output:
@@ -576,19 +582,6 @@ def post_process_specualate(
                 model_output.mp_rank,
                 save_each_rank,
             )
-
-    # Update pre_ids through accept tokens
-
-    speculate_set_value_by_flags_and_idx(
-        model_output.pre_ids,
-        model_output.accept_tokens,
-        model_output.accept_num,
-        model_output.stop_flags,
-        model_output.seq_lens_this_time,
-        model_output.seq_lens_encoder,
-        model_output.seq_lens_decoder,
-        model_output.step_idx,
-    )
 
 
 def post_process(

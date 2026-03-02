@@ -628,6 +628,17 @@ class SpeculativeSampler(nn.Layer):
         self.line_break_id = fd_config.model_config.line_break_id
         self.enf_gen_phase_tag = fd_config.speculative_config.enf_gen_phase_tag
 
+        # Verify strategy derived from config (replaces env vars in CUDA kernel)
+        spec_config = fd_config.speculative_config
+        self.use_topk = spec_config.verify_strategy == "topk"
+        self.use_target_sampling = spec_config.verify_strategy == "target_sampling"
+        self.enable_topp = spec_config.verify_strategy in ("topp", "topk")
+        self.prefill_one_step_stop = spec_config.prefill_one_step_stop
+
+        # Accept policy from config (can be overridden by function parameters)
+        self.config_accept_all = spec_config.accept_policy == "accept_all"
+        self.config_reject_all = spec_config.accept_policy == "reject_all"
+
     def pre_process(self, skip_idx_list: List[int] = []):
         """pre process before running"""
         pass
@@ -807,6 +818,10 @@ class SpeculativeSampler(nn.Layer):
             max_model_len,
         )
 
+        # Accept policy: config default OR function parameter (OR logic)
+        final_accept_all = self.config_accept_all or accept_all_drafts
+        final_reject_all = self.config_reject_all or reject_all_drafts or self.speculative_benchmark_mode
+
         speculate_verify(
             sampled_token_ids,
             share_inputs["accept_tokens"],
@@ -831,9 +846,12 @@ class SpeculativeSampler(nn.Layer):
             share_inputs["reasoning_status"],
             max_model_len,
             self.speculative_verify_window,
-            True,  # enable_topp
-            (self.speculative_benchmark_mode or reject_all_drafts),
-            accept_all_drafts,
+            self.enable_topp,
+            final_reject_all,
+            final_accept_all,
+            self.use_topk,
+            self.use_target_sampling,
+            self.prefill_one_step_stop,
         )
 
         num_logprobs = sampling_metadata.max_num_logprobs
