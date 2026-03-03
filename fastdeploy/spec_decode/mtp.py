@@ -695,6 +695,20 @@ class MTPProposer(Proposer):
         Prepare MTP inputs
         """
         use_v1_cache_scheduler = bool(envs.ENABLE_V1_KVCACHE_SCHEDULER)
+        logger.info("==================Input draft_model_preprocess==================")
+        logger.info(f"D role: {self.role}")
+        logger.info(f'T seq_lens_this_time: {self.target_model_inputs["seq_lens_this_time"]}')
+        logger.info(f'T seq_lens_encoder: {self.target_model_inputs["seq_lens_encoder"]}')
+        logger.info(f'T seq_lens_decoder: {self.target_model_inputs["seq_lens_decoder"]}')
+        logger.info(f'T step_idx: {self.target_model_inputs["step_idx"]}')
+        logger.info(f'T stop_flags: {self.target_model_inputs["stop_flags"]}')
+        logger.info(f'D seq_lens_this_time: {self.model_inputs["seq_lens_this_time"]}')
+        logger.info(f'D seq_lens_encoder: {self.model_inputs["seq_lens_encoder"]}')
+        logger.info(f'D seq_lens_decoder: {self.model_inputs["seq_lens_decoder"]}')
+        logger.info(f'D step_idx: {self.model_inputs["step_idx"]}')
+        logger.info(f'D stop_flags: {self.model_inputs["stop_flags"]}')
+        # logger.info(f'D input_ids: {self.model_inputs["input_ids"].numpy().tolist()}')
+        logger.info("==============Fin=====================")
         draft_model_preprocess(
             self.model_inputs["draft_tokens"],
             self.model_inputs["input_ids"],
@@ -723,7 +737,15 @@ class MTPProposer(Proposer):
             self.role == "prefill",
             use_v1_cache_scheduler,
         )
-
+        logger.info("======MTP Input =====")
+        logger.info(f'D seq_lens_this_time: {self.model_inputs["seq_lens_this_time"]}')
+        logger.info(f'D seq_lens_encoder: {self.model_inputs["seq_lens_encoder"]}')
+        logger.info(f'D seq_lens_decoder: {self.model_inputs["seq_lens_decoder"]}')
+        logger.info(f'D step_idx: {self.model_inputs["step_idx"]}')
+        logger.info(f'D stop_flags: {self.model_inputs["stop_flags"]}')
+        # logger.info(f'D input_ids: {self.model_inputs["input_ids"].numpy().tolist()}')
+        logger.info(f'D draft_tokens: {self.model_inputs["draft_tokens"]}')
+        logger.info("==============Fin=====================")
         target_hidden_states = eagle_get_hidden_states(
             full_hidden_states,
             self.model_inputs["seq_lens_this_time"],
@@ -737,6 +759,7 @@ class MTPProposer(Proposer):
         )
 
         self.model_inputs["target_hidden_states"].copy_(target_hidden_states, False)
+        logger.info("======MTP Input =====")
 
     def _post_process(self, sampled_token_ids):
         """
