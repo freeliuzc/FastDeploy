@@ -870,6 +870,8 @@ class GPUModelRunner(ModelRunnerBase):
                     self._cached_launch_token_num = -1
                     if self.speculative_decoding:
                         # D speculate decode, seq_lens_this_time = length + 1
+                        logger.info(f"seq_lens_this_time: {length + 1}")
+                        logger.info(f"draft_tokens: {request.draft_token_ids}")
                         self.share_inputs["seq_lens_this_time"][idx : idx + 1] = length + 1
                         self.share_inputs["draft_tokens"][idx : idx + 1, 0 : length + 1] = paddle.to_tensor(
                             request.draft_token_ids[0 : length + 1],
@@ -2044,9 +2046,12 @@ class GPUModelRunner(ModelRunnerBase):
     ) -> None:
         model_inputs, p_done_idxs, _ = self._preprocess(model_forward_batch, num_running_requests)
         model_output = self._execute(model_inputs)
-        if model_output is None:
-            if self.fd_config.speculative_config.method == SpecMethod.MTP and hasattr(
-                    self.proposer.model, "empty_input_forward") and self.parallel_config.use_ep:
+        if model_output is None or self.share_inputs["seq_lens_this_time_cpu"].numpy().sum().item() == 0:
+            if (
+                self.fd_config.speculative_config.method == SpecMethod.MTP
+                and hasattr(self.proposer.model, "empty_input_forward")
+                and self.parallel_config.use_ep
+            ):
                 self._execute_empty_mtp_input(self.forward_meta)
             return
         model_output_data, sampler_output, post_process_event = self._postprocess(
