@@ -1451,9 +1451,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         task.metrics.scheduler_recv_req_time = time.time()
 
         eng.scheduler = Mock(get_requests=Mock(return_value=[]), put_results=Mock())
-        eng.engine_worker_queue = Mock(
-            exist_tasks=Mock(return_value=False), put_tasks=Mock(), num_tasks=Mock(return_value=0)
-        )
+        eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), put_tasks=Mock())
         eng._send_error_response = Mock()
 
         eng.resource_manager = self._make_v1_decode_rm(eng, ([task], [("rid_x", None), ("rid_y", "bad")]))
@@ -1487,9 +1485,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         task.metrics.scheduler_recv_req_time = time.time()
 
         eng.scheduler = Mock(get_requests=Mock(return_value=[]), put_results=Mock())
-        eng.engine_worker_queue = Mock(
-            exist_tasks=Mock(return_value=False), put_tasks=Mock(), num_tasks=Mock(return_value=0)
-        )
+        eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), put_tasks=Mock())
 
         eng.resource_manager = self._make_v1_decode_rm(eng, ([task], []))
 
@@ -1520,9 +1516,7 @@ class TestCommonEngineAdditionalCoverage(unittest.TestCase):
         task.metrics.scheduler_recv_req_time = time.time()
 
         eng.scheduler = Mock(get_requests=Mock(return_value=[]), put_results=Mock())
-        eng.engine_worker_queue = Mock(
-            exist_tasks=Mock(return_value=False), put_tasks=Mock(), num_tasks=Mock(return_value=0)
-        )
+        eng.engine_worker_queue = Mock(exist_tasks=Mock(return_value=False), put_tasks=Mock())
         eng._send_error_response = Mock()
 
         eng.resource_manager = self._make_v1_decode_rm(eng, ([task], [("rid_none", None)]))
